@@ -132,8 +132,8 @@ const useCustomPersistedStore = defineStore({
 const store = useCounterStore()
 
 // 监听每次状态变更
-store.$subscribe((key, newVal, oldVal) => {
-  console.log(`[${key}]`, oldVal, '→', newVal)
+store.$subscribe(() => {
+    console.log('Store updated')
 })
 ```
 
