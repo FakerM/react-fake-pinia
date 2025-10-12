@@ -2,320 +2,339 @@
  * 一个接近pinia的微型状态管理仓库。
  * 支持state，getters，actions。
  * 支持持久化。
- * 
+ * 支持getters缓存。
+ *
  * 不支持插件。
  * 不支持组合式API。
- * 不支持getters缓存。想要缓存，可以使用useMemo。 
  */
-/* eslint-disable @typescript-eslint/no-explicit-any */
-import { useEffect, useReducer } from 'react';
-type Listener<T> = (state: T) => void;
+import { useEffect, useReducer } from "react";
 
+// ===== 类型定义 =====
 
+/**
+ * `defineStore` 函数的返回类型。
+ * 它既是一个可以在组件中使用的Hook，又附加了一个.get()方法用于在非组件环境下安全地获取store实例。
+ */
+export type UseStore<S extends object, G extends Record<string, (state: S) => any>, A> = (() => StoreInstance<S, G, A>) & {
+	get: () => StoreInstance<S, G, A>;
+};
+
+type Listener<S> = (state: S, changes: Partial<S>) => void;
 type Writable<T> = {
-    -readonly [K in keyof T]: T[K];
+	-readonly [K in keyof T]: T[K];
 };
-
-type StoreInstance<
-    S extends object,
-    G extends Record<string, (state: S) => any>,
-    A
-> = Writable<S> &
-    Readonly<GettersReturnTypes<G>> &
-    Readonly<A> &
-    Readonly<StoreWithState<S>>;
-
-
-
-// 持久化配置类型
+type StoreInstance<S extends object, G extends Record<string, (state: S) => any>, A> = Writable<S> & Readonly<GettersReturnTypes<G>> & Readonly<A> & Readonly<StoreWithState<S>>;
 export type PersistOptions = {
-    /** 是否启用持久化 */
-    enabled?: boolean;
-    /** 存储引擎，默认为localStorage */
-    storage?: Storage;
-    /** 存储的key前缀，默认为'qm-store-' */
-    prefix?: string;
-    /** 自定义序列化方法 */
-    serialize?: (value: any) => string;
-    /** 自定义反序列化方法 */
-    deserialize?: (value: string) => any;
+	enabled?: boolean;
+	storage?: Storage;
+	prefix?: string;
+	serialize?: (value: unknown) => string;
+	deserialize?: (value: string) => unknown;
 };
-
-// Store基础设施类型
 export type StoreWithState<S> = {
-    $id: string;
-    $state: S;
-    $patch: (partialState: Partial<S>) => void;
-    $subscribe: (listener: Listener<S>) => () => void;
-    $reset: () => void;
+	$id: string;
+	$state: S;
+	$patch: (partialState: Partial<S>) => void;
+	$subscribe: (listener: Listener<S>) => () => void;
+	$reset: () => void;
 };
-
-// 提取getters的返回类型
 export type GettersReturnTypes<G> = {
-    readonly [K in keyof G]: G[K] extends (...args: any[]) => infer R ? R : never
+	readonly [K in keyof G]: G[K] extends (...args: any[]) => infer R ? R : never;
 };
 
-// Store上下文类型
-export type StoreContext<S, G> = S & GettersReturnTypes<G> & StoreWithState<S>;
+// ===== 全局响应式系统 =====
 
-/**
- * 定义Store选项
- */
-export interface StoreDefinition<S extends object, G, A> {
-    state: () => S;
-    getters?: G;
-    actions?: A;
-    persist?: boolean | PersistOptions;
+const storeInstances = new Map<string, unknown>();
+const globalGetterCache = new Map<string, any>();
+const globalPropertyToGetters = new Map<string, Set<string>>();
+const globalGetterToDependencies = new Map<string, Set<string>>(); // To track dependencies of each getter
+const globalActiveGetters: string[] = [];
+
+declare const module: {
+	hot?: {
+		accept: () => void;
+		dispose: (callback: () => void) => void;
+	};
+};
+if (import.meta.hot) {
+	import.meta.hot.on("vite:beforeUpdate", () => {
+		storeInstances.clear();
+		globalGetterCache.clear();
+		globalPropertyToGetters.clear();
+		globalGetterToDependencies.clear();
+	});
+}
+if (typeof module !== "undefined" && module.hot) {
+	module.hot.accept();
+	module.hot.dispose(() => {
+		storeInstances.clear();
+		globalGetterCache.clear();
+		globalPropertyToGetters.clear();
+		globalGetterToDependencies.clear();
+	});
 }
 
-/**
-* 定义仓库
-* @param id 仓库的id。用于区分多仓库。
-* @param options state，getters，actions的配置
-* @returns 返回一个函数，调用该函数可以获取仓库实例
-*/
+// ===== 默认配置 =====
 
-
-// 存储所有store实例
-const storeInstances = new Map<string, any>();
-
-interface ImportMeta {
-    hot?: {
-        on: (event: string, callback: (payload: any) => void) => void;
-    };
-    env?: {
-        MODE: string,
-    }
-}
-
-// vite热更新
-if ((import.meta as ImportMeta).hot) {
-    (import.meta as ImportMeta).hot?.on('vite:beforeUpdate', () => {
-        storeInstances.clear();
-    });
-}
-// webpack 热更新
-// Webpack HMR 安全判断（防止在 Vite 环境中抛出异常）
-declare const module: any;
-
-if (typeof module !== 'undefined' && module.hot) {
-    module.hot.accept();
-    module.hot.dispose(() => {
-        storeInstances.clear();
-    });
-}
-
-// 默认持久化配置
 const defaultPersistOptions: PersistOptions = {
-    enabled: true,
-    storage: typeof window !== 'undefined' ? window.localStorage : undefined as any,
-    prefix: 'qm-store-',
-    serialize: JSON.stringify,
-    deserialize: JSON.parse
+	enabled: true,
+	storage: typeof window !== "undefined" ? window.localStorage : undefined,
+	prefix: "qm-store-",
+	serialize: JSON.stringify,
+	deserialize: JSON.parse,
 };
 
-// 实际实现
-export function defineStore<
-    S extends object,
-    G extends Record<string, (state: S) => any>,
-    A
->(
-    id: string,
-    options: {
-        state: () => S,
-        getters?: G & ThisType<S>,
-        actions?: A & ThisType<S & GettersReturnTypes<G> & StoreWithState<S> & A>,
-        persist?: boolean | PersistOptions,
-    }
-): () => S & GettersReturnTypes<G> & StoreWithState<S> & A {
-    // 如果已存在缓存，则直接返回缓存实例
-    if (storeInstances.has(id)) {
-        return () => storeInstances.get(id);
-    }
-    let isUpdating = false;
+// ===== `defineStore` 核心实现 =====
 
-    // 处理持久化配置
-    const persistOptions: PersistOptions | false = options.persist
-        ? typeof options.persist === 'boolean'
-            ? defaultPersistOptions
-            : { ...defaultPersistOptions, ...options.persist }
-        : false;
+function defineStore<S extends object, G extends Record<string, (...args: any[]) => any>, A extends Record<string, (...args: any[]) => any>>(
+	id: string,
+	options: {
+		state: () => S;
+		getters?: G & ThisType<S & GettersReturnTypes<G>>;
+		actions?: A & ThisType<S & GettersReturnTypes<G> & StoreWithState<S> & A>;
+		persist?: boolean | PersistOptions;
+		debug?: boolean;
+	}
+): UseStore<S, G, A> {
+	if (storeInstances.has(id)) {
+		return storeInstances.get(id) as UseStore<S, G, A>;
+	}
 
-    // 从持久化存储中恢复状态
-    let initialState: S;
-    if (persistOptions && persistOptions.enabled && persistOptions.storage) {
-        try {
-            const storageKey = `${persistOptions.prefix || ''}${id}`;
-            const storedState = persistOptions.storage.getItem(storageKey);
-            if (storedState) {
-                const deserializedState = persistOptions.deserialize
-                    ? persistOptions.deserialize(storedState)
-                    : JSON.parse(storedState);
-                initialState = { ...options.state(), ...deserializedState };
-            } else {
-                initialState = options.state();
-            }
-        } catch (e) {
-            console.error('从持久化存储恢复状态失败:', e);
-            initialState = options.state();
-        }
-    } else {
-        initialState = options.state();
-    }
+	let isUpdating = false;
+	let currentChanges: Partial<S> = {};
+	const state = options.state();
+	const subscribers = new Set<Listener<S>>();
 
-    // 防止state中定义了与系统保留字段冲突的键
-    // 保留字段：$id, $state, $patch, $reset, $subscribe
-    const reservedKeys = ['$id', '$state', '$patch', '$reset', '$subscribe'];
-    Object.keys(initialState).forEach((key) => {
-        if (reservedKeys.includes(key)) {
-            throw new Error(
-                `State key "${key}" 与系统保留字段冲突，请更换命名（保留字段: ${reservedKeys.join(', ')})`
-            );
-        }
-    });
+	const depTrackingProxy = new Proxy(state, {
+		get(target, prop) {
+			if (globalActiveGetters.length > 0) {
+				const propKey = `${id}/${String(prop)}`;
+				if (!globalPropertyToGetters.has(propKey)) {
+					globalPropertyToGetters.set(propKey, new Set());
+				}
+				const dependents = globalPropertyToGetters.get(propKey)!;
 
-    const state = initialState;
-    const subscribers = new Set<Listener<S>>();
+				// The property is a dependency for ALL currently active getters
+				globalActiveGetters.forEach((getterKey) => dependents.add(getterKey));
 
-    // 状态代理，拦截所有state的访问和修改
-    const stateProxy = new Proxy(state, {
-        get(target, prop) {
-            return Reflect.get(target, prop);
-        },
-        set(target, prop, value) {
-            Reflect.set(target, prop, value);
-            return true;
-        }
-    });
+				// And the most recent getter depends on this property
+				const currentGetterKey = globalActiveGetters[globalActiveGetters.length - 1];
+				if (!globalGetterToDependencies.has(currentGetterKey)) {
+					globalGetterToDependencies.set(currentGetterKey, new Set());
+				}
+				globalGetterToDependencies.get(currentGetterKey)!.add(propKey);
+			}
+			return Reflect.get(target, prop);
+		},
+	});
 
-    // 持久化状态到存储
-    function persistState() {
-        if (persistOptions && persistOptions.enabled && persistOptions.storage) {
-            try {
-                const storageKey = `${persistOptions.prefix || ''}${id}`;
-                const serializedState = persistOptions.serialize
-                    ? persistOptions.serialize(state)
-                    : JSON.stringify(state);
-                persistOptions.storage.setItem(storageKey, serializedState);
-            } catch (e) {
-                console.error('持久化状态到存储失败:', e);
-            }
-        }
-    }
+	const persistOptions: PersistOptions | false = options.persist ? (typeof options.persist === "boolean" ? defaultPersistOptions : { ...defaultPersistOptions, ...options.persist }) : false;
 
+	if (persistOptions && persistOptions.enabled && persistOptions.storage) {
+		try {
+			const storageKey = `${persistOptions.prefix || ""}${id}`;
+			const storedState = persistOptions.storage.getItem(storageKey);
+			const deserializedState = storedState ? persistOptions.deserialize!(storedState) : {};
+			Object.assign(state, deserializedState as Partial<S>);
+		} catch (e) {
+			console.error(`[Store] 从持久化存储恢复状态失败 (id: ${id}):`, e);
+		}
+	}
 
-    // Store 基础对象
-    const store = {
-        $id: id,
-        $state: stateProxy,
-        $patch(partialState: Partial<S>) {
-            isUpdating = true;
-            Object.entries(partialState).forEach(([key, value]) => {
-                storeProxy[key as keyof S] = value;
-            });
-            isUpdating = false;
-            notifySubscribers();
-        },
-        $subscribe(listener: Listener<S>) {
-            subscribers.add(listener);
-            return () => subscribers.delete(listener);
-        },
-        $reset() {
-            isUpdating = true;
-            Object.assign(state, options.state());
-            isUpdating = false;
-            notifySubscribers();
-        }
-    } as any; // 使用any临时断言，后面会具体类型化
+	function notifySubscribers(changes: Partial<S>) {
+		if (Object.keys(changes).length === 0) return;
+		subscribers.forEach((listener) => listener(state, changes));
+		persistState();
+	}
 
-    // Getters 绑定
-    if (options.getters) {
-        Object.entries(options.getters).forEach(([key, getter]) => {
-            Object.defineProperty(store, key, {
-                get: () => {
-                    return getter(stateProxy);
-                },
-                enumerable: true
-            });
-        });
-    }
+	function persistState() {
+		if (persistOptions && persistOptions.enabled && persistOptions.storage) {
+			try {
+				const storageKey = `${persistOptions.prefix || ""}${id}`;
+				persistOptions.storage!.setItem(storageKey, persistOptions.serialize!(state));
+			} catch (e) {
+				console.error(`[Store] 持久化状态到存储失败 (id: ${id}):`, e);
+			}
+		}
+	}
 
-    // 复制state到store
-    Object.keys(state).forEach(key => {
-        if (!(key in store)) {
-            Object.defineProperty(store, key, {
-                get: () => state[key as keyof S],
-                set: (value) => {
-                    state[key as keyof S] = value;
-                },
-                enumerable: true
-            });
-        }
-    });
+	const store: Record<string, any> = {
+		$id: id,
+		get $state() {
+			return state;
+		},
+		$patch(partialState: Partial<S>) {
+			const oldState = options.debug ? { ...state } : null;
+			for (const key in partialState) {
+				if (Object.prototype.hasOwnProperty.call(partialState, key)) {
+					(currentChanges as any)[key] = state[key as keyof S];
+				}
+			}
 
-    // Actions 绑定
-    if (options.actions) {
-        Object.entries(options.actions).forEach(([key, action]) => {
-            (store as any)[key] = function (...args: any[]) {
-                isUpdating = true;
-                // 使用类型断言确保正确的上下文和参数类型
-                const result = action.apply(storeProxy, args);
-                if (result instanceof Promise) {
-                    return result.finally(() => {
-                        isUpdating = false;
-                        notifySubscribers();
-                    });
-                }
-                isUpdating = false;
-                notifySubscribers();
-                return result;
-            };
-        });
-    }
-    // 通知订阅者，状态更新
-    function notifySubscribers() {
-        subscribers.forEach(listener => listener(store.$state));
-        persistState();
-    }
-    // 创建访问代理
-    const storeProxy = new Proxy(store, {
-        get(target, prop) {
-            if (prop in target) return Reflect.get(target, prop);
-            return Reflect.get(stateProxy, prop);
-        },
-        set(_target, prop, value) {
-            const descriptor = Reflect.getOwnPropertyDescriptor(state, prop);
+			isUpdating = true;
+			try {
+				Object.assign(state, partialState);
+			} finally {
+				isUpdating = false;
+				if (options.debug) {
+					console.groupCollapsed(`[Store patch] ${id} @ ${new Date().toLocaleTimeString()}`);
+					console.log("%c prev state", "color: #9E9E9E; font-weight: bold;", oldState);
+					console.log("%c patch", "color: #03A9F4; font-weight: bold;", partialState);
+					console.log("%c next state", "color: #4CAF50; font-weight: bold;", { ...state });
+					console.groupEnd();
+				}
+				notifySubscribers(currentChanges);
+				currentChanges = {};
+			}
+		},
+		$subscribe(listener: Listener<S>) {
+			subscribers.add(listener);
+			return () => subscribers.delete(listener);
+		},
+		$reset() {
+			this.$patch(options.state());
+		},
+	};
 
-            // 如果不是 state 自身的属性（即 prop 不是 state 的 key），则不处理
-            if (!descriptor) {
-                console.warn(`[Store warning] 不能设置非state属性 "${String(prop)}"`);
-                return false;
-            }
+	const storeProxy = new Proxy(store, {
+		get(target, prop) {
+			if (Reflect.has(target, prop)) {
+				return Reflect.get(target, prop);
+			}
+			return Reflect.get(depTrackingProxy, prop);
+		},
+		set(_target, prop, value) {
+			if (!Reflect.has(state, prop)) {
+				console.warn(`[Store warning] 不能直接设置非state属性 "${String(prop)}". 请在action中操作。`);
+				return false;
+			}
 
-            const prev = state[prop as keyof typeof state];
-            const changed = prev !== value;
+			const key = prop as keyof S;
+			const prev = state[key];
+			const changed = prev !== value;
+			const result = Reflect.set(state, prop, value);
 
-            const result = Reflect.set(state, prop, value);
+			if (changed) {
+				const propKey = `${id}/${String(prop)}`;
+				const gettersToInvalidate = globalPropertyToGetters.get(propKey);
+				if (gettersToInvalidate) {
+					gettersToInvalidate.forEach((getterKey) => {
+						globalGetterCache.delete(getterKey);
+					});
+				}
 
-            if (changed && !isUpdating) {
-                notifySubscribers();
-            }
+				(currentChanges as any)[key] = prev;
+			}
 
-            return result;
-        }
-    });
-    storeInstances.set(id, storeProxy);
-    // 返回 Hook
-    return function useStore() {
-        const [, forceUpdate] = useReducer(x => x + 1, 0);
-        useEffect(() => {
-            const unsubscribe = storeProxy.$subscribe(() => {
-                forceUpdate();
-            });
-            return unsubscribe;
-        }, []);
-        return storeProxy as StoreInstance<S, G, A>;
-    };
+			if (changed && !isUpdating) {
+				if (options.debug) {
+					console.groupCollapsed(`[Store mutation] ${id} -> ${String(prop)} @ ${new Date().toLocaleTimeString()}`);
+					console.log("%c prev value", "color: #9E9E9E; font-weight: bold;", prev);
+					console.log("%c next value", "color: #4CAF50; font-weight: bold;", value);
+					console.groupEnd();
+				}
+				notifySubscribers(currentChanges);
+				currentChanges = {};
+			}
+
+			return result;
+		},
+	}) as StoreInstance<S, G, A>;
+
+	if (options.getters) {
+		for (const [key, getter] of Object.entries(options.getters)) {
+			Object.defineProperty(store, key, {
+				get: () => {
+					const getterKey = `${id}/${key}`;
+
+					if (globalGetterCache.has(getterKey)) {
+						// If we are inside another getter computation, and this one is cached,
+						// we must still establish the dependency link.
+						if (globalActiveGetters.length > 0) {
+							const dependencies = globalGetterToDependencies.get(getterKey);
+							if (dependencies) {
+								const outerGetterKey = globalActiveGetters[globalActiveGetters.length - 1];
+								dependencies.forEach((dep) => {
+									// Link state -> outer getter
+									if (!globalPropertyToGetters.has(dep)) globalPropertyToGetters.set(dep, new Set());
+									globalPropertyToGetters.get(dep)!.add(outerGetterKey);
+									// Link outer getter -> state
+									if (!globalGetterToDependencies.has(outerGetterKey)) globalGetterToDependencies.set(outerGetterKey, new Set());
+									globalGetterToDependencies.get(outerGetterKey)!.add(dep);
+								});
+							}
+						}
+						return globalGetterCache.get(getterKey);
+					}
+
+					globalActiveGetters.push(getterKey);
+					globalGetterToDependencies.delete(getterKey); // Clear old dependencies before re-tracking
+					const value = getter.call(storeProxy);
+					globalActiveGetters.pop();
+					globalGetterCache.set(getterKey, value);
+					return value;
+				},
+				enumerable: true,
+			});
+		}
+	}
+
+	if (options.actions) {
+		for (const key in options.actions) {
+			const action = options.actions[key];
+			store[key] = function (...args: Parameters<typeof action>): ReturnType<typeof action> {
+				const oldState = options.debug ? { ...state } : null;
+				isUpdating = true;
+				let result;
+
+				const notify = () => {
+					isUpdating = false;
+					if (options.debug) {
+						console.groupCollapsed(`[Store action] ${id} -> ${key} @ ${new Date().toLocaleTimeString()}`);
+						console.log("%c prev state", "color: #9E9E9E; font-weight: bold;", oldState);
+						console.log("%c args", "color: #03A9F4; font-weight: bold;", args);
+						console.log("%c next state", "color: #4CAF50; font-weight: bold;", { ...state });
+						console.groupEnd();
+					}
+					notifySubscribers(currentChanges);
+					currentChanges = {};
+				};
+
+				try {
+					result = action.apply(storeProxy, args);
+				} finally {
+					if (!(result instanceof Promise)) {
+						notify();
+					}
+				}
+
+				if (result instanceof Promise) {
+					return result.finally(notify) as ReturnType<typeof action>;
+				}
+				return result;
+			};
+		}
+	}
+
+	const useStore = Object.assign(
+		() => {
+			const [, forceUpdate] = useReducer((x) => x + 1, 0);
+
+			useEffect(() => {
+				const unsubscribe = storeProxy.$subscribe(() => forceUpdate());
+				return unsubscribe;
+			}, []);
+
+			return storeProxy;
+		},
+		{
+			get: () => storeProxy,
+		}
+	) as UseStore<S, G, A>;
+
+	storeInstances.set(id, useStore);
+
+	return useStore;
 }
 
 export default defineStore;
