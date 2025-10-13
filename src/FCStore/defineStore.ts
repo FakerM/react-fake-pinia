@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 /**
  * 一个接近pinia的微型状态管理仓库。
  * 支持state，getters，actions。
