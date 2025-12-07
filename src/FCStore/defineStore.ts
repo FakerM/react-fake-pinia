@@ -1,136 +1,16 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 /**
- * 一个接近 Pinia 的微型状态管理仓库。
+ * FCStore - 一个轻量级、高性能的 React 状态管理库。
+ * 设计理念源于 Pinia，极简 API，完美契合 React。
  *
- * 特性：
- * - 支持 State：管理应用的状态数据。
- * - 支持 Getters：派生状态，并具有缓存机制。
- * - 支持 Actions：封装业务逻辑，可异步操作。
- * - 支持 持久化：通过配置将状态存储到本地存储。
- *
- * 不支持：
- * - 插件系统
- * - 组合式 API
- *
- * @module FCStore/defineStore
+ * 核心特性：
+ * 1. 极简 API：类似 Pinia 的 `defineStore`，零样板代码。
+ * 2. 高性能：基于 Proxy 的浅层拦截，配合 $patch 进行批量更新。
+ * 3. HMR 支持：内置热模块替换，开发时状态不丢失。
+ * 4. 持久化：开箱即用的状态持久化支持。
+ * 5. React Hooks：完美契合 React 函数式组件生态。
  */
 import { useEffect, useReducer } from "react";
-
-// ===== 类型定义 =====
-
-/**
- * `defineStore` 函数的返回类型。
- * 它既是一个可以在 React 组件中使用的 Hook，也附加了一个 `.get()` 方法用于在非组件环境下安全地获取 store 实例。
- * @template S - 状态对象的类型
- * @template G - Getters 对象的类型
- * @template A - Actions 对象的类型
- */
-export type UseStore<S extends object, G extends Record<string, (state: S) => any>, A> = (() => StoreInstance<S, G, A>) & {
-	/**
-	 * 在非组件环境下获取 store 实例的方法。
-	 * @returns Store 实例
-	 */
-	get: () => StoreInstance<S, G, A>;
-};
-
-/**
- * 状态订阅器的监听函数类型。
- * 当 store 状态发生变化时，会调用此函数。
- * @template S - 状态对象的类型
- * @param state - 当前的完整状态
- * @param changes - 发生变化的部分状态
- */
-type Listener<S> = (state: S, changes: Partial<S>) => void;
-
-/**
- * 将类型 T 的所有属性变为可写（移除 readonly 修饰符）。
- * @template T - 原始类型
- */
-type Writable<T> = {
-	-readonly [K in keyof T]: T[K];
-};
-
-/**
- * Store 实例的类型。
- * 包含了可写的 State 属性、只读的 Getters 返回值、只读的 Actions 方法以及 StoreWithState 提供的额外属性。
- * @template S - 状态对象的类型
- * @template G - Getters 对象的类型
- * @template A - Actions 对象的类型
- */
-type StoreInstance<S extends object, G extends Record<string, (state: S) => any>, A> = Writable<S> & Readonly<GettersReturnTypes<G>> & Readonly<A> & Readonly<StoreWithState<S>>;
-
-/**
- * 持久化配置选项的类型。
- */
-export type PersistOptions = {
-	/** 是否启用持久化，默认为 true */
-	enabled?: boolean;
-	/** 存储机制，默认为 localStorage */
-	storage?: Storage;
-	/** 存储键的前缀，默认为 "qm-store-" */
-	prefix?: string;
-	/** 序列化函数，默认为 JSON.stringify */
-	serialize?: (value: unknown) => string;
-	/** 反序列化函数，默认为 JSON.parse */
-	deserialize?: (value: string) => unknown;
-};
-
-/**
- * Store 实例中与状态相关的额外属性和方法。
- * @template S - 状态对象的类型
- */
-export type StoreWithState<S> = {
-	/** Store 的唯一标识符 */
-	$id: string;
-	/** 原始状态对象 */
-	$state: S;
-	/**
-	 * 批量更新状态的方法。
-	 * @param partialState - 部分状态对象，用于合并到当前状态
-	 */
-	$patch: (partialState: Partial<S>) => void;
-	/**
-	 * 订阅状态变化的方法。
-	 * @param listener - 状态变化监听函数
-	 * @returns 取消订阅函数
-	 */
-	$subscribe: (listener: Listener<S>) => () => void;
-	/** 重置状态到初始值的方法 */
-	$reset: () => void;
-};
-
-/**
- * Getters 返回值的类型映射。
- * @template G - Getters 对象的类型
- */
-export type GettersReturnTypes<G> = {
-	readonly [K in keyof G]: G[K] extends (...args: any[]) => infer R ? R : never;
-};
-
-// ===== 全局响应式系统 =====
-
-/**
- * 存储所有 store 实例的 Map，键为 store 的 ID。
- */
-const storeInstances = new Map<string, unknown>();
-/**
- * 存储所有 getter 缓存值的 Map，键为 `storeId/getterName`。
- */
-const globalGetterCache = new Map<string, any>();
-/**
- * 存储状态属性到依赖该属性的 getter 列表的 Map。
- * 键为 `storeId/propertyName`，值为依赖该属性的 getter 键集合。
- */
-const globalPropertyToGetters = new Map<string, Set<string>>();
-/**
- * 存储 getter 到其所依赖的状态属性列表的 Map。
- * 键为 `storeId/getterName`，值为该 getter 依赖的状态属性键集合。
- */
-const globalGetterToDependencies = new Map<string, Set<string>>(); // 用于追踪每个 getter 的依赖
-/**
- * 当前正在计算的 getter 栈，用于依赖收集。
- */
-const globalActiveGetters: string[] = [];
 
 declare const module: {
 	hot?: {
@@ -139,401 +19,363 @@ declare const module: {
 	};
 };
 
-interface ImportMeta {
-	hot?: {
-		on: (event: string, callback: (payload: any) => void) => void;
-	};
-	env?: {
-		MODE: string;
-	};
-}
-
 /**
- * Vite 环境下的热模块替换 (HMR) 处理。
- * 在 Vite 模块更新前，清空所有缓存和实例，确保状态重置。
+ * `defineStore` 返回的 Hook 类型。
+ * 除了作为 Hook 使用外，还挂载了 `get()` 方法，用于在组件外部（如工具函数、其他 Store）中访问 Store 实例。
  */
-if ((import.meta as ImportMeta).hot) {
-	(import.meta as ImportMeta).hot?.on("vite:beforeUpdate", () => {
-		// 清空所有 store 实例，强制重新创建
-		storeInstances.clear();
-		// 清空所有 getter 缓存
-		globalGetterCache.clear();
-		// 清空属性到 getter 的依赖映射
-		globalPropertyToGetters.clear();
-		// 清空 getter 到属性的依赖映射
-		globalGetterToDependencies.clear();
-	});
-}
-
-/**
- * Webpack 环境下的热模块替换 (HMR) 处理。
- * 在 Webpack 模块更新时，接受更新并清空所有缓存和实例，确保状态重置。
- */
-if (typeof module !== "undefined" && module.hot) {
-	module.hot.accept();
-	module.hot.dispose(() => {
-		// 清空所有 store 实例，强制重新创建
-		storeInstances.clear();
-		// 清空所有 getter 缓存
-		globalGetterCache.clear();
-		// 清空属性到 getter 的依赖映射
-		globalPropertyToGetters.clear();
-		// 清空 getter 到属性的依赖映射
-		globalGetterToDependencies.clear();
-	});
-}
-
-// ===== 默认配置 =====
-
-/**
- * 默认的持久化配置。
- */
-const defaultPersistOptions: PersistOptions = {
-	enabled: true, // 默认启用持久化
-	storage: typeof window !== "undefined" ? window.localStorage : undefined, // 默认使用 localStorage
-	prefix: "qm-store-", // 默认存储键前缀
-	serialize: JSON.stringify, // 默认序列化方法
-	deserialize: JSON.parse, // 默认反序列化方法
+export type UseStore<S extends object, A extends Record<string, any>> = (() => Store<S, A>) & {
+	/**
+	 * 获取 Store 的原始实例（非 Hook）。
+	 * 适用于组件外部或跨 Store 调用的场景。
+	 */
+	get: () => Store<S, A>;
 };
 
-// ===== `defineStore` 核心实现 =====
+/**
+ * 状态变更监听器。
+ * @param state - 变更后的最新状态快照。
+ * @param prevState - 变更前的状态快照。
+ * @param changes - 本次变更的属性集合（Delta）。
+ */
+type Listener<S> = (state: S, prevState: S, changes: Partial<S>) => void;
+
+/**
+ * 完整的 Store 实例类型。
+ * 包含：State 属性 + Actions 方法 + 内置 API ($patch, $reset 等)。
+ */
+export type Store<S, A> = S & A & StoreWithState<S>;
+
+/**
+ * 持久化配置选项。
+ */
+export type PersistOptions = {
+	/** 是否启用持久化 */
+	enabled?: boolean;
+	/** 存储引擎，默认为 localStorage */
+	storage?: Storage;
+	/** 存储键前缀，防止键名冲突 */
+	prefix?: string;
+	/** 序列化方法，默认为 JSON.stringify */
+	serialize?: (value: unknown) => string;
+	/** 反序列化方法，默认为 JSON.parse */
+	deserialize?: (value: string) => unknown;
+};
+
+/**
+ * Store 内置 API 接口。
+ */
+export type StoreWithState<S> = {
+	/** Store 的唯一标识符 */
+	$id: string;
+	/** 原始状态对象 */
+	$state: S;
+	/**
+	 * 批量更新状态。
+	 * 相比直接赋值，`$patch` 会合并多次变更为一次通知，优化性能。
+	 * 对于深层对象更新，必须使用此方法。
+	 */
+	$patch: (partialState: Partial<S>) => void;
+	/**
+	 * 订阅状态变更。
+	 * @returns 取消订阅的函数。
+	 */
+	$subscribe: (listener: Listener<S>) => () => void;
+	/** 重置状态为初始值 */
+	$reset: () => void;
+};
+
+// 全局状态缓存，用于单例模式和 HMR 状态保持
+const storeInstances = new Map<string, any>();
+const HMR_CONTEXT_KEY = Symbol("HMR_CONTEXT");
+
+/**
+ * 应用变更并返回有效变更集和旧值集
+ */
+function applyChanges<S>(state: S, partial: Partial<S>) {
+	const effectiveChanges: Partial<S> = {};
+	let hasChanges = false;
+
+	for (const [key, value] of Object.entries(partial)) {
+		const k = key as keyof S;
+		const oldValue = state[k];
+		// 基础类型严格比较，对象类型总是认为变更（支持外部 mutation）
+		if (oldValue === value && (typeof value !== "object" || value === null)) continue;
+
+		(state as any)[k] = value;
+		(effectiveChanges as any)[k] = value;
+		hasChanges = true;
+	}
+
+	return { hasChanges, effectiveChanges };
+}
+
+/**
+ * 创建 Action 的高阶包装函数。
+ *
+ * 职责：
+ * 1. 批量更新事务：在 Action 执行期间，暂停通知，收集所有变更。
+ * 2. 异步支持：自动处理 Promise，确保异步操作结束后正确触发通知。
+ * 3. 错误处理：在 Action 抛出异常时正确回滚更新锁。
+ */
+function createActionWrapper(storeProxy: any, actionFn: (...args: any[]) => any, ctx: any) {
+	return (...args: any[]) => {
+		const previousIsUpdating = ctx.isUpdating;
+		// 开启批量更新事务
+		if (!ctx.isUpdating) {
+			ctx.isUpdating = true;
+			ctx.batchOldState = { ...ctx.state }; // 快照当前状态
+			ctx.batchChanges = {}; // 重置变更累积器
+		}
+
+		// 事务结束后的提交逻辑
+		const commit = () => {
+			if (!previousIsUpdating) {
+				ctx.isUpdating = false;
+				// 如果有变更，则触发一次合并通知
+				if (Object.keys(ctx.batchChanges).length > 0) {
+					ctx.notify(ctx.batchOldState, ctx.batchChanges);
+					ctx.batchChanges = {};
+				}
+			}
+		};
+
+		try {
+			// 显式绑定 this 为 storeProxy，确保 Action 内能通过 this 访问 State/Actions
+			const res = actionFn.apply(storeProxy, args);
+			// 处理异步 Action
+			if (res instanceof Promise) return res.finally(commit);
+			// 处理同步 Action
+			commit();
+			return res;
+		} catch (e) {
+			// 异常回滚：确保锁被释放，避免 Store 锁死
+			if (!previousIsUpdating) ctx.isUpdating = false;
+			throw e;
+		}
+	};
+}
+
+/**
+ * 处理热模块替换 (HMR)。
+ *
+ * 策略：
+ * 1. State：增量补全。保留现有状态值，仅合并新代码中新增的字段。
+ * 2. Actions：热替换。直接用新定义覆盖旧定义，立即生效。
+ */
+function handleHMR(id: string, options: any) {
+	const useStore = storeInstances.get(id);
+	const storeProxy = useStore.get();
+	const ctx = storeProxy[HMR_CONTEXT_KEY];
+
+	// 1. 补全 State (处理新增字段)
+	// 注意：不删除旧字段，以防止 HMR 导致的数据意外丢失
+	const newState = options.state();
+	for (const key in newState) {
+		if (!(key in ctx.state)) {
+			const val = newState[key];
+			// 浅拷贝防止引用污染
+			if (Array.isArray(val)) ctx.state[key] = [...val] as any;
+			else if (typeof val === "object" && val !== null) ctx.state[key] = { ...val } as any;
+			else ctx.state[key] = val;
+		}
+	}
+
+	// 2. 热替换 Actions
+	if (options.actions) {
+		for (const key in options.actions) {
+			storeProxy[key] = createActionWrapper(storeProxy, options.actions[key], ctx);
+		}
+	}
+
+	return useStore;
+}
+
+// 核心实现
 
 /**
  * 定义一个 Store。
- * @template S - 状态对象的类型。
- * @template G - Getters 对象的类型。
- * @template A - Actions 对象的类型。
+ *
  * @param id - Store 的唯一标识符。
- * @param options - Store 的配置选项。
- * @param options.state - 返回初始状态的函数。
- * @param options.getters - 定义派生状态的 Getters 对象。
- * @param options.actions - 定义修改状态和业务逻辑的 Actions 对象。
- * @param options.persist - 持久化配置，可以是 boolean 或 PersistOptions 对象。
- * @param options.debug - 是否启用调试模式，会在控制台输出状态变化日志。
- * @returns 一个 UseStore Hook，用于在组件中获取 Store 实例，并提供 `.get()` 方法在非组件环境获取。
+ * @param options - 配置选项 (State, Actions, Persist)。
  */
-function defineStore<S extends object, G extends Record<string, (...args: any[]) => any>, A extends Record<string, (...args: any[]) => any>>(
+function defineStore<S extends object, A extends Record<string, any>>(
 	id: string,
 	options: {
 		state: () => S;
-		getters?: G & ThisType<S & GettersReturnTypes<G>>;
-		actions?: A & ThisType<S & GettersReturnTypes<G> & StoreWithState<S> & A>;
+		actions?: A & ThisType<S & A & StoreWithState<S>>;
 		persist?: boolean | PersistOptions;
 		debug?: boolean;
 	}
-): UseStore<S, G, A> {
-	if (storeInstances.has(id)) {
-		return storeInstances.get(id) as UseStore<S, G, A>;
-	}
+): UseStore<S, A> {
+	// HMR 拦截：如果 Store 已存在，进入热更新流程
+	if (storeInstances.has(id)) return handleHMR(id, options) as UseStore<S, A>;
 
-	// 标记是否正在进行状态更新，用于避免重复触发订阅者通知
-	let isUpdating = false;
-	// 存储当前批次状态变化的详情
-	let currentChanges: Partial<S> = {};
-	// 初始化状态
-	const state = options.state();
-	// 存储状态订阅者
-	const subscribers = new Set<Listener<S>>();
+	// 内部上下文，封装了 Store 的核心状态和私有属性
+	const ctx = {
+		state: options.state(),
+		subscribers: new Set<Listener<S>>(),
+		isUpdating: false, // 批量更新锁
+		batchOldState: {} as S, // 批量更新前的状态快照
+		batchChanges: {} as Partial<S>, // 批量更新期间的变更累积
+		notify: null as any,
+	};
 
-	/**
-	 * 依赖追踪代理。
-	 * 当 getter 访问 state 属性时，会通过此代理进行依赖收集。
-	 */
-	const depTrackingProxy = new Proxy(state, {
-		get(target, prop) {
-			// 如果当前有正在计算的 getter，则进行依赖收集
-			if (globalActiveGetters.length > 0) {
-				const propKey = `${id}/${String(prop)}`;
-				// 确保该属性在 globalPropertyToGetters 中有对应的 Set
-				if (!globalPropertyToGetters.has(propKey)) {
-					globalPropertyToGetters.set(propKey, new Set());
-				}
-				const dependents = globalPropertyToGetters.get(propKey)!;
+	// 持久化处理
+	const pOpts = options.persist
+		? {
+				enabled: true,
+				storage: window.localStorage,
+				prefix: "qm-store-",
+				serialize: JSON.stringify,
+				deserialize: JSON.parse,
+				...(typeof options.persist === "object" ? options.persist : {}),
+		  }
+		: undefined;
 
-				// 将当前所有活跃的 getter 添加为该属性的依赖
-				globalActiveGetters.forEach((getterKey) => dependents.add(getterKey));
-
-				// 将该属性添加为最内层活跃 getter 的依赖
-				const currentGetterKey = globalActiveGetters[globalActiveGetters.length - 1];
-				if (!globalGetterToDependencies.has(currentGetterKey)) {
-					globalGetterToDependencies.set(currentGetterKey, new Set());
-				}
-				globalGetterToDependencies.get(currentGetterKey)!.add(propKey);
-			}
-			return Reflect.get(target, prop);
-		},
-	});
-
-	// 处理持久化配置
-	const persistOptions: PersistOptions | false = options.persist ? (typeof options.persist === "boolean" ? defaultPersistOptions : { ...defaultPersistOptions, ...options.persist }) : false;
-
-	// 如果启用持久化，则从存储中恢复状态
-	if (persistOptions && persistOptions.enabled && persistOptions.storage) {
+	// 启动时恢复持久化状态
+	if (pOpts?.enabled && pOpts.storage) {
 		try {
-			const storageKey = `${persistOptions.prefix || ""}${id}`;
-			const storedState = persistOptions.storage.getItem(storageKey);
-			const deserializedState = storedState ? persistOptions.deserialize!(storedState) : {};
-			Object.assign(state, deserializedState as Partial<S>);
+			const data = pOpts.storage.getItem(`${pOpts.prefix}${id}`);
+			if (data) Object.assign(ctx.state, pOpts.deserialize!(data));
 		} catch (e) {
-			console.error(`[Store] 从持久化存储恢复状态失败 (id: ${id}):`, e);
+			console.error(`[Store] Load failed:`, e);
 		}
 	}
 
-	/**
-	 * 通知所有订阅者状态已更新。
-	 * @param changes - 发生变化的部分状态。
-	 */
-	function notifySubscribers(changes: Partial<S>) {
-		if (Object.keys(changes).length === 0) return;
-		subscribers.forEach((listener) => listener(state, changes));
-		persistState(); // 状态变化后进行持久化
-	}
-
-	/**
-	 * 将当前状态持久化到存储中。
-	 */ function persistState() {
-		if (persistOptions && persistOptions.enabled && persistOptions.storage) {
+	// 通知订阅者并持久化
+	ctx.notify = (prevState: S, changes: Partial<S>) => {
+		// 开发环境下冻结 changes，防止订阅者意外修改
+		if (process.env.NODE_ENV !== "production") Object.freeze(changes);
+		ctx.subscribers.forEach((l) => l(ctx.state, prevState, changes));
+		if (pOpts?.enabled && pOpts.storage) {
 			try {
-				const storageKey = `${persistOptions.prefix || ""}${id}`;
-				persistOptions.storage!.setItem(storageKey, persistOptions.serialize!(state));
+				pOpts.storage.setItem(`${pOpts.prefix}${id}`, pOpts.serialize!(ctx.state));
 			} catch (e) {
-				console.error(`[Store] 持久化状态到存储失败 (id: ${id}):`, e);
+				console.error(`[Store] Save failed:`, e);
 			}
 		}
-	}
+	};
 
-	const store: Record<string, any> = {
-		$id: id, // Store 的唯一标识符
-		/**
-		 * 获取当前状态。
-		 */
+	const store: any = {
+		$id: id,
+		[HMR_CONTEXT_KEY]: ctx, // 暴露上下文给 HMR
 		get $state() {
-			return state;
+			return ctx.state;
 		},
-		/**
-		 * 批量更新状态。
-		 * @param partialState - 需要更新的部分状态。
-		 */
-		$patch(partialState: Partial<S>) {
-			const oldState = options.debug ? { ...state } : null; // 调试模式下记录旧状态
-			// 记录本次 patch 导致的状态变化，用于通知订阅者
-			for (const key in partialState) {
-				if (Object.prototype.hasOwnProperty.call(partialState, key)) {
-					(currentChanges as any)[key] = state[key as keyof S];
-				}
-			}
+		$patch(partial: Partial<S>) {
+			// 在修改前进行快照，确保 prevState 的准确性
+			const oldState = { ...ctx.state };
+			const { hasChanges, effectiveChanges } = applyChanges(ctx.state, partial);
+			if (!hasChanges) return;
 
-			isUpdating = true; // 标记正在更新状态
-			try {
-				Object.assign(state, partialState); // 合并部分状态到当前状态
-			} finally {
-				isUpdating = false; // 结束更新标记
-				if (options.debug) {
-					// 调试模式下输出状态变化日志
-					console.groupCollapsed(`[Store patch] ${id} @ ${new Date().toLocaleTimeString()}`);
-					console.log("%c prev state", "color: #9E9E9E; font-weight: bold;", oldState);
-					console.log("%c patch", "color: #03A9F4; font-weight: bold;", partialState);
-					console.log("%c next state", "color: #4CAF50; font-weight: bold;", { ...state });
-					console.groupEnd();
-				}
-				notifySubscribers(currentChanges); // 通知订阅者状态已更新
-				currentChanges = {}; // 清空本次变化记录
+			if (ctx.isUpdating) {
+				// 事务中：仅累积变更
+				Object.assign(ctx.batchChanges, effectiveChanges);
+			} else {
+				// 事务外：立即通知
+				ctx.notify(oldState, effectiveChanges);
 			}
 		},
-		/**
-		 * 订阅状态变化。
-		 * @param listener - 状态变化监听函数。
-		 * @returns 取消订阅函数。
-		 */
-		$subscribe(listener: Listener<S>) {
-			subscribers.add(listener);
-			return () => subscribers.delete(listener);
+		$subscribe(fn: Listener<S>) {
+			if (ctx.subscribers.has(fn)) console.warn(`[Store] Listener already attached to store "${id}".`);
+			ctx.subscribers.add(fn);
+			return () => ctx.subscribers.delete(fn);
 		},
-		/**
-		 * 重置状态到初始值。
-		 */
 		$reset() {
-			this.$patch(options.state());
+			const newState = options.state();
+			const oldState = { ...ctx.state };
+			const changes: Partial<S> = {};
+			let hasChanges = false;
+
+			// 1. 删除多余字段
+			for (const key in ctx.state) {
+				if (!(key in newState)) {
+					delete (ctx.state as any)[key];
+					(changes as any)[key] = undefined;
+					hasChanges = true;
+				}
+			}
+			// 2. 覆盖/重置字段
+			for (const key in newState) {
+				const newVal = newState[key];
+				const oldVal = ctx.state[key];
+				if (oldVal !== newVal) {
+					ctx.state[key] = newVal;
+					(changes as any)[key] = newVal;
+					hasChanges = true;
+				}
+			}
+			if (hasChanges) ctx.notify(oldState, changes);
 		},
 	};
 
-	/**
-	 * Store 的代理对象，用于拦截属性访问和修改。
-	 * 使得可以直接通过 store.property 访问 state 属性，并通过 store.property = value 修改 state 属性。
-	 */
+	// 代理拦截
 	const storeProxy = new Proxy(store, {
 		get(target, prop) {
-			// 如果属性存在于 store 自身（如 $id, $state, $patch 等），则直接返回
-			if (Reflect.has(target, prop)) {
-				return Reflect.get(target, prop);
-			}
-			// 否则，从 depTrackingProxy（即原始 state）中获取，用于依赖收集
-			return Reflect.get(depTrackingProxy, prop);
+			// 优先返回 Store 自身属性 (Actions, $patch 等)
+			if (prop in target) return target[prop];
+			// 其次返回 State 属性
+			return ctx.state[prop as keyof S];
 		},
-		set(_target, prop, value) {
-			// 如果尝试设置的属性不在 state 中，则发出警告
-			if (!Reflect.has(state, prop)) {
-				console.warn(`[Store warning] 不能直接设置非state属性 "${String(prop)}". 请在action中操作。`);
+		set(target, prop, value) {
+			// 1. 允许修改 Store 自身属性 (用于 HMR 更新 Actions)
+			if (prop in target) {
+				target[prop] = value;
+				return true;
+			}
+			// 2. 安全检查：禁止动态添加 State 根属性
+			if (!(prop in ctx.state)) {
+				console.warn(`[Store] Set unknown prop "${String(prop)}"`);
 				return false;
 			}
-
-			const key = prop as keyof S;
-			const prev = state[key]; // 记录旧值
-			const changed = prev !== value; // 判断值是否发生变化
-			const result = Reflect.set(state, prop, value); // 设置新值到 state
-
-			if (changed) {
-				const propKey = `${id}/${String(prop)}`;
-				// 获取依赖此属性的所有 getter
-				const gettersToInvalidate = globalPropertyToGetters.get(propKey);
-				if (gettersToInvalidate) {
-					// 使这些 getter 的缓存失效
-					gettersToInvalidate.forEach((getterKey) => {
-						globalGetterCache.delete(getterKey);
-					});
+			// 3. 响应式更新 State
+			const oldValue = ctx.state[prop as keyof S];
+			// 基础类型严格比较，对象类型总是认为变更
+			if (oldValue !== value || (typeof value === "object" && value !== null)) {
+				if (ctx.isUpdating) {
+					(ctx.batchChanges as any)[prop] = value;
+					(ctx.state as any)[prop] = value;
+				} else {
+					const oldState = { ...ctx.state };
+					(ctx.state as any)[prop] = value;
+					ctx.notify(oldState, { [prop]: value } as any);
 				}
-
-				(currentChanges as any)[key] = prev; // 记录本次变化，用于通知订阅者
 			}
-
-			// 如果状态发生变化且当前不在批量更新中，则通知订阅者
-			if (changed && !isUpdating) {
-				if (options.debug) {
-					// 调试模式下输出状态变化日志
-					console.groupCollapsed(`[Store mutation] ${id} -> ${String(prop)} @ ${new Date().toLocaleTimeString()}`);
-					console.log("%c prev value", "color: #9E9E9E; font-weight: bold;", prev);
-					console.log("%c next value", "color: #4CAF50; font-weight: bold;", value);
-					console.groupEnd();
-				}
-				notifySubscribers(currentChanges); // 通知订阅者状态已更新
-				currentChanges = {}; // 清空本次变化记录
-			}
-
-			return result;
+			return true;
 		},
-	}) as StoreInstance<S, G, A>;
+	});
 
-	if (options.getters) {
-		// 遍历所有定义的 getter
-		for (const [key, getter] of Object.entries(options.getters)) {
-			// 为 store 实例定义 getter 属性
-			Object.defineProperty(store, key, {
-				get: () => {
-					const getterKey = `${id}/${key}`;
-
-					// 如果 getter 缓存中存在，则直接返回缓存值
-					if (globalGetterCache.has(getterKey)) {
-						// 如果我们处于另一个 getter 的计算上下文中，且当前 getter 已被缓存，
-						// 仍然需要建立依赖关系（将当前 getter 的依赖转给外层 getter）。
-						if (globalActiveGetters.length > 0) {
-							const dependencies = globalGetterToDependencies.get(getterKey);
-							if (dependencies) {
-								const outerGetterKey = globalActiveGetters[globalActiveGetters.length - 1];
-								dependencies.forEach((dep) => {
-									// 建立状态属性到外层 getter 的依赖
-									if (!globalPropertyToGetters.has(dep)) globalPropertyToGetters.set(dep, new Set());
-									globalPropertyToGetters.get(dep)!.add(outerGetterKey);
-									// 建立外层 getter 到状态属性的依赖
-									if (!globalGetterToDependencies.has(outerGetterKey)) globalGetterToDependencies.set(outerGetterKey, new Set());
-									globalGetterToDependencies.get(outerGetterKey)!.add(dep);
-								});
-							}
-						}
-						return globalGetterCache.get(getterKey);
-					}
-
-					// 将当前 getter 加入活跃 getter 栈，开始依赖收集
-					globalActiveGetters.push(getterKey);
-					// 清除旧的依赖，准备重新收集
-					globalGetterToDependencies.delete(getterKey);
-					// 调用原始 getter 函数计算值
-					const value = getter.call(storeProxy);
-					// 从活跃 getter 栈中移除当前 getter，结束依赖收集
-					globalActiveGetters.pop();
-					// 缓存 getter 的计算结果
-					globalGetterCache.set(getterKey, value);
-					return value;
-				},
-				enumerable: true,
-			});
-		}
-	}
-
+	// 挂载 Actions
 	if (options.actions) {
-		// 遍历所有定义的 action
-		for (const key in options.actions) {
-			const action = options.actions[key];
-			// 为 store 实例定义 action 方法
-			store[key] = function (...args: Parameters<typeof action>): ReturnType<typeof action> {
-				const oldState = options.debug ? { ...state } : null; // 调试模式下记录旧状态
-				isUpdating = true; // 标记正在更新状态
-				// result 的类型可以是 action 的返回值，也可以是 Promise<action 的返回值>，或者 undefined
-				let result: ReturnType<typeof action> | Promise<ReturnType<typeof action>> | undefined = undefined;
-				/**
-				 * 通知订阅者并处理调试日志的内部函数。
-				 */
-				const notify = () => {
-					isUpdating = false; // 结束更新标记
-					if (options.debug) {
-						// 调试模式下输出 action 执行日志
-						console.groupCollapsed(`[Store action] ${id} -> ${key} @ ${new Date().toLocaleTimeString()}`);
-						console.log("%c prev state", "color: #9E9E9E; font-weight: bold;", oldState);
-						console.log("%c args", "color: #03A9F4; font-weight: bold;", args);
-						console.log("%c next state", "color: #4CAF50; font-weight: bold;", { ...state });
-						console.groupEnd();
-					}
-					notifySubscribers(currentChanges); // 通知订阅者状态已更新
-					currentChanges = {}; // 清空本次变化记录
-				};
-
-				try {
-					result = action.apply(storeProxy, args); // 执行原始 action
-				} finally {
-					// 如果 action 返回的不是 Promise，则立即通知订阅者
-					if (!(result instanceof Promise)) {
-						notify();
-					}
-				}
-
-				// 如果 action 返回 Promise，则在 Promise 结束后通知订阅者
-				if (result instanceof Promise) {
-					return result.finally(notify) as unknown as ReturnType<typeof action>;
-				}
-				return result as ReturnType<typeof action>;
-			};
+		const actions = options.actions;
+		for (const key in actions) {
+			store[key] = createActionWrapper(storeProxy, actions[key], ctx);
 		}
 	}
 
-	/**
-	 * 用于在 React 组件中使用的 Hook。
-	 * 当 Store 状态变化时，会强制组件重新渲染。
-	 */
+	// Hook 创建
 	const useStore = Object.assign(
 		() => {
-			// 使用 useReducer 强制组件更新
-			const [, forceUpdate] = useReducer((x) => x + 1, 0);
-
-			// 在组件挂载时订阅状态变化，在卸载时取消订阅
-			useEffect(() => {
-				const unsubscribe = storeProxy.$subscribe(() => forceUpdate());
-				return unsubscribe;
-			}, []);
-
-			return storeProxy; // 返回 Store 实例
+			// 使用 useReducer 强制组件重渲染
+			const [, forceUpdate] = useReducer((c) => c + 1, 0);
+			// 组件挂载时订阅，卸载时自动取消
+			useEffect(() => storeProxy.$subscribe(forceUpdate), []);
+			return storeProxy;
 		},
-		{
-			/**
-			 * 在非组件环境下获取 Store 实例。
-			 * @returns Store 实例。
-			 */
-			get: () => storeProxy,
-		}
-	) as UseStore<S, G, A>;
+		{ get: () => storeProxy }
+	);
 
-	// 将创建的 useStore 实例存储起来，以便重复使用
 	storeInstances.set(id, useStore);
 
-	return useStore; // 返回 useStore Hook
+	// Webpack HMR 支持
+	if (typeof module !== "undefined" && module.hot) {
+		module.hot.accept();
+		module.hot.dispose(() => {
+			storeInstances.clear();
+		});
+	}
+
+	return useStore as any;
 }
 
-export default defineStore; // 导出 defineStore 函数
+export default defineStore;
