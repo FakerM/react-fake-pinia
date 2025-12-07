@@ -1,19 +1,18 @@
 import { defineStore } from "../FCStore";
 
 export const useCounterStore = defineStore("counter", {
-	debug: true,
 	state: () => ({
 		count: 0,
 	}),
-	getters: {
-		doubledCount(): number {
-			console.log("%c ✨ counterStore: doubledCount is computing... ", "color: white; background-color: #f5a623; padding: 2px 4px; border-radius: 3px;");
+	actions: {
+		getDoubledCount(): number {
 			return this.count * 2;
 		},
-	},
-	actions: {
+		getReDoubleCount() {
+			return this.getDoubledCount() * 2;
+		},
 		consoleGetter() {
-			console.log(this.doubledCount);
+			console.log(this.getDoubledCount());
 		},
 		increment() {
 			this.count++;
